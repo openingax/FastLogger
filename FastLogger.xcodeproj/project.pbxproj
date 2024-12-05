@@ -15,6 +15,7 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
+				"To-Do.txt",
 			);
 			target = 5F102E4D2CF998BF00A38F32 /* FastLogger */;
 		};
