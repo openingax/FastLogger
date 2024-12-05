@@ -114,6 +114,7 @@ static void* flush_thread_func(void* arg) {
     return NULL;
 }
 
+//__attribute__((constructor))
 int fast_logger_init(void) {
     if (logger != NULL) return 0;  // 已经初始化
     
@@ -245,6 +246,7 @@ int fast_logger_write(LogLevel level, const char* module, const char* message) {
     return 0;
 }
 
+// __attribute__((destructor))
 void fast_logger_cleanup(void) {
     if (!logger) return;
     

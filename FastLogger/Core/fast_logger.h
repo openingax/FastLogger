@@ -20,7 +20,7 @@ typedef enum {
     LOG_LEVEL_ERROR
 } LogLevel;
 
-// 初始化函数
+// 初始化函数，可考虑加 __attribute__((constructor))，以让系统启动时自动调用此函数
 int fast_logger_init(void);
 
 // 设置日志文件
