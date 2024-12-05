@@ -1,0 +1,1845 @@
+//
+//  UWMapView.m
+//  VacuumMap
+//
+//  Created by 谢立颖 on 2023/6/12.
+//
+
+#import "UWMapView.h"
+
+@import CoreGraphics;
+@import Masonry;
+@import UwantUtilKit;
+@import SDWebImage;
+
+#import "UWMapDefine.h"
+#import "UWMapEnum.h"
+#import "UIImage+Bitmap.h"
+#import "UWMapViewDataModel.h"
+#import "UWAliyunLogKit.h"
+#import "UwantHomeApp-Swift.h"
+
+// Subview
+#import "UWMapImageView.h"
+#import "UWRCTPathView.h"
+#import "UWRCTRoomInfoView.h"
+#import "UWRCTForbiddenAreaView.h"
+#import "UWRCTSelectCleanAreaView.h"
+#import "UWRCTVirtualWallView.h"
+#import "UWRCTDoorsillView.h"
+#import "UWRCTSplitLineView.h"
+#import "UWMapChargerView.h"
+#import "UWMapRobotView.h"
+#import "UWMapRobotBreathView.h"
+#import "UWRCTAreaViewProtocol.h"
+
+@interface UWMapView () <UIScrollViewDelegate, UWMapViewRefreshDelegate, UIGestureRecognizerDelegate, UWRCTAreaViewProtocol>
+
+/// Subviews
+@property(nonatomic, strong) UIScrollView *scrollView;
+@property(nonatomic, strong) UIView *contentView;
+@property(nonatomic, strong) UWMapImageView *mapImageView;
+
+@property(nonatomic, strong) UWRCTPathView *pathView;
+@property(nonatomic, strong) UWRCTRoomInfoView *roomInfoView;
+@property(nonatomic, strong) UIView *materialContainerView;
+@property(nonatomic, strong) UIView *chargerAroundView;
+@property(nonatomic, strong) CAShapeLayer *chargerAroundLineLayer;
+@property(nonatomic, strong) UIImageView *pileTrayIconImageView;
+@property(nonatomic, strong) UIImageView *pileIconImageView;
+@property(nonatomic, assign) CGFloat chargerAngle;
+
+@property(nonatomic, strong) UWMapRobotView *robotView;
+@property(nonatomic, strong) UWMapRobotBreathView *robotBreathView;
+
+@property(nonatomic, strong) UIImageView *fixedPointImageView;
+@property(nonatomic, strong, nullable) NSValue *fixedPointInMap;
+
+/// Debug View
+/// 点击地图时用红色的点显示手指点击的位置
+@property(nonatomic, strong) UIView *debugRedTapPoint;
+@property(nonatomic, assign) CGPoint lastTapPointInMap;
+
+
+@property(nonatomic, strong) NSMutableArray<UWRCTSelectCleanAreaView *> *selectCleanViews;
+@property(nonatomic, strong) NSMutableArray<UWRCTForbiddenAreaView *> *forbiddenViews;
+@property(nonatomic, strong) NSMutableArray<UWRCTVirtualWallView *> *virtualWallViews;
+@property(nonatomic, strong) NSMutableArray<UWRCTDoorsillView *> *doorsillViews;
+@property(nonatomic, strong) UWRCTSplitLineView *splitLineView;
+
+@property(nonatomic, strong) NSMutableArray<NSString *> *selectRegionPixelTypes;
+
+
+@end
+
+@implementation UWMapView
+
+- (instancetype)initWithViewModel:(UWMapViewModel *)viewModel {
+    if (self = [super init]) {
+        NSLog(@"UWMapView init");
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(applicationWillEnterForeground:)
+                                                     name:UIApplicationWillEnterForegroundNotification
+                                                   object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(applicationDidEnterBackground:)
+                                                     name:UIApplicationDidEnterBackgroundNotification
+                                                   object:nil];
+        
+        _viewModel = viewModel;
+        _viewModel.delegate = self;
+        [self setupSubviews];
+    }
+    return self;
+}
+
+- (void)dealloc {
+    NSLog(@"UWMapView dealloc");
+}
+
+- (void)setupSubviews {
+    self.backgroundColor = [UIColor clearColor];
+    [self setupScrollView];
+    [self setupTapGesture];
+}
+
+
+#pragma mark - Notification
+
+- (void)applicationWillEnterForeground:(NSNotification *)noti {
+    // 尝试重启呼吸动画
+    [self updateRobotBreathViewState];
+}
+
+- (void)applicationDidEnterBackground:(NSNotification *)noti {
+    // 停止呼吸动画
+    [_robotBreathView stopAnimation];
+}
+
+
+#pragma mark - UWMapViewRefreshDelegate
+
+/// 初始化地图数据
+- (void)viewModelDidInitViewData {
+    /**
+     重新建图时，可能 self 还没进行布局（后来没复现这个场景，导致这段逻辑没办法测，by xiely, 2023/08/15 19:00）
+     在加载地图管理页时复现这个逻辑了，使用 U300 T2 的机器（by xiely, 2023/08/15 23:25)
+     */
+    if (CGRectEqualToRect(self.frame, CGRectZero) || CGRectEqualToRect(_scrollView.frame, CGRectZero)) {
+        // self 的 frame 为 CGRectZero，但此时 self.superview 的 frame 不为 CGRectZero 了，此时让 superview 强制做布局，就能让 self 有 origin 和 size 了
+        [self.superview setNeedsLayout];
+        [self.superview layoutIfNeeded];
+    }
+    
+    [self setupContentView];
+    [self setupMapView];
+    [self setupPathView];
+    [self setupRoomInfoView];
+    [self setupMaterialObject];
+    [self setupRobotImageView];
+    [self updateRobotBreathViewState];
+    [self setupChargerImageView];
+    [self setupFixedPointImageView];
+#if DEBUG
+//        [self setupDebugView];
+#endif
+    
+    CGFloat ratio = [self suitableRatio];
+    self.scrollView.minimumZoomScale = _viewModel.mapModel.minZoomScale * ratio;
+    self.scrollView.maximumZoomScale = _viewModel.mapModel.maxZoomScale * ratio;
+    
+    /**
+     添加完地图的子视图后，需要强制重新布局，否则系统不会调用 layoutSubviews 方法去更新 contentView 和 mapImageView 的布局
+     不加这两行的话，contentView 和 mapImageView 的 size 都为 {0, 0}
+     */
+    [self setNeedsLayout];
+    [self layoutIfNeeded];
+    [self setContentViewCenterAlignWithAnimated:NO];
+    
+    // 旋转地图
+    CGFloat angle = _viewModel.mapDegree * M_PI / 180.0;
+    [self viewModelDidRotateMap:angle];
+    
+    // 地图旋转后，把它缩放到一个合适的比例
+    CGFloat scale = ratio * _viewModel.mapModel.scale;
+    scale = MAX(_scrollView.minimumZoomScale, MIN(scale, _scrollView.maximumZoomScale));
+    CGFloat scaleX = _viewModel.mapModel.scaleX;
+    CGFloat scaleY = _viewModel.mapModel.scaleY;
+    [self.scrollView setZoomScale:scale animated:NO];
+    if (CGFloatIsZero(scaleX) && CGFloatIsZero(scaleY)) {
+        [self setContentViewCenterAlignWithAnimated:NO];
+    } else {
+        // 居中显示时的 offset
+        CGFloat offsetX = (_contentView.frame.size.width - _scrollView.frame.size.width) / 2.0;
+        CGFloat offsetY = (_contentView.frame.size.height - _scrollView.frame.size.height) / 2.0;
+
+        CGFloat mapOffsetX = scaleX - _viewModel.mapWidth / 2.0;
+        CGFloat mapOffsetY = scaleY - _viewModel.mapHeight / 2.0;
+        CGFloat scaleOffsetX = mapOffsetX * scale;
+        CGFloat scaleOffsetY = mapOffsetY * scale;
+        
+        offsetX += scaleOffsetX;
+        offsetY += scaleOffsetY;
+        
+        [self.scrollView setContentOffset:CGPointMake(offsetX, offsetY) animated:false];
+    }
+    
+    NSLog(@"[UWMapView] %s | mapView(%.2lf, %.2lf) pathView(%.2lf, %.2lf) roomInfoView(%.2lf, %.2lf)", __func__,
+          _mapImageView.frame.size.width,
+          _mapImageView.frame.size.height,
+          _pathView.frame.size.width,
+          _pathView.frame.size.height,
+          _roomInfoView.frame.size.width,
+          _roomInfoView.frame.size.height);
+    
+    UINavigationController *hostNavVC = [self findNavigationController];
+    for (UIGestureRecognizer *gesture in hostNavVC.view.gestureRecognizers) {
+        if ([gesture isKindOfClass:[UIScreenEdgePanGestureRecognizer class]]) {
+            [self.scrollView.panGestureRecognizer requireGestureRecognizerToFail:gesture];
+        }
+    }
+}
+
+- (void)viewModelDidReloadMapView {
+    [self viewModelDidUpdateMapState:_viewModel.mapState edit:_viewModel.isEdit];
+}
+
+/// 计算 scrollView 的 contentOffset，使 contentView 在 scrollView 里居中显示
+- (void)setContentViewCenterAlignWithAnimated:(BOOL)animated {
+    CGFloat offsetX = (_contentView.frame.size.width - _scrollView.frame.size.width) / 2.0;
+    CGFloat offsetY = (_contentView.frame.size.height - _scrollView.frame.size.height) / 2.0;
+    [self.scrollView setContentOffset:CGPointMake(offsetX, offsetY) animated:animated];
+}
+
+/// 刷新地图数据
+- (void)viewModelDidRefreshMap {
+//    CGFloat contentViewWidth = self.scrollView.frame.size.width * 3;
+//    CGFloat contentViewHeight = self.scrollView.frame.size.height * 3;
+//    if (!CGSizeEqualToSize(_contentView.bounds.size, CGSizeMake(contentViewWidth, contentViewHeight))) {
+//        [self setupContentView];
+//    }
+    /**
+     地图数据刷新后，宽高可能变，所以要改 imageView 的宽高
+     先取出 mapImageView.center，这个 center 就是 contentView 的中心点
+     mapImageView 的宽高改变后，frame 也会变，相对应的 center 也会变
+     所以改变宽高后要重新设置 mapImageView 的 center
+     */
+   
+    BOOL needUpdateMapSize = NO;
+    if (_mapImageView.bounds.size.width != _viewModel.mapWidth || _mapImageView.bounds.size.height != _viewModel.mapHeight) {
+        needUpdateMapSize = YES;
+        CGPoint imageViewCenter = _mapImageView.center;
+        _mapImageView.bounds = CGRectMake(0, 0, _viewModel.mapWidth, _viewModel.mapHeight);
+        _mapImageView.center = imageViewCenter;
+    }
+    
+    UIImage *mapImage = [_viewModel mapBitmapImage];
+    [self updateMapImage:mapImage];
+    // 更新房间信息视图
+    [self updateRoomInfoView];
+    
+    // 更新虚拟物品
+    [self updateMaterialObject];
+    
+    if (needUpdateMapSize) {
+        // 建图过程/建图完成后，地图的信息可能会变，这时如果不主动改 minimumZoomScale 和 maximumZoomScale，可能出现建图完成后无法缩小地图的问题
+        CGFloat ratio = [self suitableRatio];
+        self.scrollView.minimumZoomScale = _viewModel.mapModel.minZoomScale * ratio;
+        self.scrollView.maximumZoomScale = _viewModel.mapModel.maxZoomScale * ratio;
+        
+        [self setupPathView];
+        [self viewModelDidRefreshArea];
+    }
+    
+//    if (_viewModel.mapState == UWMapStateSelectRegion) {
+//        [_selectRegionPixelTypes removeAllObjects];
+//        NSDictionary *roomInfo = _viewModel.mapModel.mapData.roomInfo;
+//        for (NSString *pixelType in roomInfo) {
+//            UWRCTMapRoomInfo *room = roomInfo[pixelType];
+//            if (room.defaultSelected) {
+//                if (![_selectRegionPixelTypes containsObject:pixelType]) {
+//                    [_selectRegionPixelTypes addObject:pixelType];
+//                }
+//            } else {
+//                if ([_selectRegionPixelTypes containsObject:pixelType]) {
+//                    [_selectRegionPixelTypes removeObject:pixelType];
+//                }
+//            }
+//        }
+//        [_roomInfoView didSelectRoomWithPixelTypes:_selectRegionPixelTypes];
+//    }
+    
+    // 更新充电桩状态
+    _pileTrayIconImageView.center = _viewModel.chargerPosition;
+    _pileIconImageView.center = _viewModel.chargerPosition;
+    _chargerAroundView.center = _viewModel.chargerPosition;
+    // 更新扫地机状态
+    CGFloat robotAngle = [_viewModel robotAngle];
+    CGFloat reverseScale = 1.0 / _scrollView.zoomScale;
+//    _robotView.transform = CGAffineTransformConcat(CGAffineTransformMakeScale(reverseScale, reverseScale), CGAffineTransformMakeRotation(robotAngle));
+    _robotView.transform = CGAffineTransformMakeRotation(robotAngle);
+    _robotView.center = _viewModel.robotPosition;
+    
+    [self updateRobotBreathViewState];
+    
+//    NSLog(@"[UWMapView] %s | mapView(%.2lf, %.2lf) pathView(%.2lf, %.2lf) roomInfoView(%.2lf, %.2lf)", __func__,
+//          _mapImageView.frame.size.width,
+//          _mapImageView.frame.size.height,
+//          _pathView.frame.size.width,
+//          _pathView.frame.size.height,
+//          _roomInfoView.frame.size.width,
+//          _roomInfoView.frame.size.height);
+}
+
+/// 刷新区域
+- (void)viewModelDidRefreshArea {
+    [self updatePointCleanArea];
+    [self setupSelectCleanArea];
+    [self setupForbiddenArea];
+    [self setupVirtualWalls];
+    [self setupDoorsills];
+    
+    if (self.viewModel.mapState == UWMapStateSelectArea) {
+        for (UIView *subview in self.selectCleanViews) {
+            [self.mapImageView bringSubviewToFront:subview];
+        }
+    } else if (self.viewModel.mapState == UWMapStateForbiddenArea) {
+        for (UIView *subview in self.forbiddenViews) {
+            [self.mapImageView bringSubviewToFront:subview];
+        }
+    } else if (self.viewModel.mapState == UWMapStateVirtualWall) {
+        for (UIView *subview in self.virtualWallViews) {
+            [self.mapImageView bringSubviewToFront:subview];
+        }
+    } else if (self.viewModel.mapState == UWMapStateDoorsill) {
+        for (UIView *subview in self.doorsillViews) {
+            [self.mapImageView bringSubviewToFront:subview];
+        }
+    }
+    [self.mapImageView bringSubviewToFront:self.pileTrayIconImageView];
+    [self.mapImageView bringSubviewToFront:self.robotBreathView];
+    [self.mapImageView bringSubviewToFront:self.robotView];
+    [self.mapImageView bringSubviewToFront:self.pileIconImageView];
+    [self.mapImageView bringSubviewToFront:self.fixedPointImageView];
+    [self.mapImageView bringSubviewToFront:self.roomInfoView];
+}
+
+/// 刷新路径
+- (void)viewModelDidRefreshPath {
+    [self setupPathView];
+    [self updateRobotBreathViewState];
+    
+    // 调整视图层级结构
+    [self.mapImageView bringSubviewToFront:self.pileTrayIconImageView];
+    [self.mapImageView bringSubviewToFront:self.robotBreathView];
+    [self.mapImageView bringSubviewToFront:self.robotView];
+    [self.mapImageView bringSubviewToFront:self.pileIconImageView];
+    [self.mapImageView bringSubviewToFront:self.fixedPointImageView];
+    [self.mapImageView bringSubviewToFront:self.roomInfoView];
+    
+//    NSLog(@"[UWMapView] %s | mapView(%.2lf, %.2lf) pathView(%.2lf, %.2lf) roomInfoView(%.2lf, %.2lf)", __func__,
+//          _mapImageView.frame.size.width,
+//          _mapImageView.frame.size.height,
+//          _pathView.frame.size.width,
+//          _pathView.frame.size.height,
+//          _roomInfoView.frame.size.width,
+//          _roomInfoView.frame.size.height);
+}
+
+- (void)viewModelDidRefreshRobotIcon {
+    [self updateRobotImage];
+}
+
+/// 刷新基站信息
+- (void)viewModelDidRefreshPileInfo {
+    UWRCTPilePosition *pilePosition = _viewModel.mapModel.pilePosition;
+    _chargerAngle = (pilePosition.degree + 90) * M_PI / 180.0;
+    CGFloat pileRadius = pilePosition.radius;
+    CGRect circleBounds = CGRectMake(0, 0, pilePosition.radius * 2.0, pilePosition.radius * 2.0);
+    
+    _chargerAroundView.bounds = circleBounds;
+    _chargerAroundView.center = _viewModel.chargerPosition;
+    _chargerAroundView.layer.cornerRadius = circleBounds.size.width / 2.0;
+    UIBezierPath *path = [UIBezierPath bezierPathWithRoundedRect:circleBounds cornerRadius:pileRadius];
+    _chargerAroundLineLayer.path = path.CGPath;
+    
+//    NSURL *pileIconUrl = [NSURL URLWithString:_viewModel.mapModel.pileIcon];
+//    [_chargerView.imageView sd_setImageWithURL:pileIconUrl];
+    [self updateChargerImage];
+}
+
+- (void)viewModelDidRefreshAppointIcon {
+    [self updateAppointImage];
+}
+
+- (void)viewModelDidRefreshMaterialObject {
+    
+}
+
+/// 刷新地图模式
+- (void)viewModelDidUpdateMapState:(UWMapState)state edit:(BOOL)edit {
+    NSLog(@"地图进入%@模式", NSStringFromUWMapState(state));
+    
+    // 默认先隐藏定点清扫的 icon
+    if (_fixedPointImageView.hidden == NO) {
+        _fixedPointImageView.hidden = YES;
+    }
+    _fixedPointInMap = nil;
+    
+    if (state == UWMapStateNormal) {
+        for (UWRCTForbiddenAreaView *view in _forbiddenViews) {
+            [view endEdit];
+        }
+        for (UWRCTVirtualWallView *view in _virtualWallViews) {
+            [view endEdit];
+        }
+        for (UWRCTDoorsillView *view in _doorsillViews) {
+            [view endEdit];
+        }
+        [_selectRegionPixelTypes removeAllObjects];
+        [_roomInfoView didSelectRoomWithPixelTypes:_selectRegionPixelTypes];
+        // 隐藏基站外圈
+        _chargerAroundView.hidden = YES;
+    } else if (state == UWMapStateFixedPoint) {
+        UWRCTMapAreaPointClean *model = [_viewModel pointCleanAreaModel];
+        if (model) {
+            _fixedPointImageView.hidden = NO;
+        }
+    } else if (state == UWMapStateSelectArea) {
+        for (UWRCTSelectCleanAreaView *view in _selectCleanViews) {
+            if (edit) {
+                [view prepareEdit];
+                [_mapImageView bringSubviewToFront:view];
+            } else {
+                [view endEdit];
+            }
+        }
+        [_selectRegionPixelTypes removeAllObjects];
+        for (NSString *roomPixelType in _viewModel.mapModel.mapData.roomInfo) {
+            UWRCTMapRoomInfo *roomInfo = _viewModel.mapModel.mapData.roomInfo[roomPixelType];
+            if (roomInfo.defaultSelected) {
+                [_selectRegionPixelTypes addObject:roomPixelType];
+            }
+        }
+        [_roomInfoView didSelectRoomWithPixelTypes:_selectRegionPixelTypes];
+        // 隐藏基站外圈
+        _chargerAroundView.hidden = YES;
+    } else if (state == UWMapStateForbiddenArea) {
+        for (UWRCTForbiddenAreaView *rectView in _forbiddenViews) {
+            [rectView prepareEdit];
+//            __weak typeof(self) weakSelf = self;
+//            rectView.beginEditHandle = ^(UWRCTForbiddenAreaView * _Nonnull view) {
+//                __strong typeof(weakSelf) strongSelf = weakSelf;
+//                for (UWRCTForbiddenAreaView *item in strongSelf.forbiddenViews) {
+//                    if (![item isEqual:view]) {
+//                        [item prepareEdit];
+//                    }
+//                }
+//                [strongSelf.mapImageView bringSubviewToFront:view];
+//            };
+            [_mapImageView bringSubviewToFront:rectView];
+        }
+        [_selectRegionPixelTypes removeAllObjects];
+        [_roomInfoView didSelectRoomWithPixelTypes:_selectRegionPixelTypes];
+        // 基站显示外圈，且显示白色虚线
+        _chargerAroundView.hidden = NO;
+        _chargerAroundLineLayer.hidden = NO;
+    } else if (state == UWMapStateVirtualWall) {
+        for (UWRCTVirtualWallView *lineView in _virtualWallViews) {
+            [lineView prepareEdit];
+            __weak typeof(self) weakSelf = self;
+            lineView.beginEditHandle = ^(UWRCTVirtualWallView * _Nonnull view) {
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                for (UWRCTVirtualWallView *item in strongSelf.virtualWallViews) {
+                    if (![item isEqual:view]) {
+                        [item prepareEdit];
+                    }
+                }
+                [strongSelf.mapImageView bringSubviewToFront:view];
+            };
+            [_mapImageView bringSubviewToFront:lineView];
+        }
+        [_selectRegionPixelTypes removeAllObjects];
+        [_roomInfoView didSelectRoomWithPixelTypes:_selectRegionPixelTypes];
+        // 显示基站外圈，且显示白色虚线
+        _chargerAroundView.hidden = NO;
+        _chargerAroundLineLayer.hidden = NO;
+    } else if (state == UWMapStateDoorsill) {
+        for (UWRCTDoorsillView *doorsillView in _doorsillViews) {
+            [doorsillView prepareEdit];
+            __weak typeof(self) weakSelf = self;
+            doorsillView.beginEditHandle = ^(UWRCTDoorsillView * _Nonnull view) {
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                for (UWRCTDoorsillView *item in strongSelf.doorsillViews) {
+                    if (![item isEqual:view]) {
+                        [item prepareEdit];
+                    }
+                }
+                [strongSelf.mapImageView bringSubviewToFront:view];
+            };
+            [_mapImageView bringSubviewToFront:doorsillView];
+        }
+        [_selectRegionPixelTypes removeAllObjects];
+        [_roomInfoView didSelectRoomWithPixelTypes:_selectRegionPixelTypes];
+        _chargerAroundView.hidden = NO;
+        _chargerAroundLineLayer.hidden = NO;
+    } else if (state == UWMapStateSelectRegion) {
+        if (!_selectRegionPixelTypes) {
+            _selectRegionPixelTypes = [NSMutableArray new];
+        }
+        [_selectRegionPixelTypes removeAllObjects];
+        
+        // 这个 for-in 勾选的逻辑不确定对其它业务有没有影响，目前是因为预约清洁里没正常显示勾选才加上这个逻辑的
+        for (NSString *pixelType in _viewModel.mapModel.mapData.roomInfo) {
+            UWRCTMapRoomInfo *roomInfo = _viewModel.mapModel.mapData.roomInfo[pixelType];
+            if (roomInfo.defaultSelected) {
+                [_selectRegionPixelTypes addObject:roomInfo.roomPixelType];
+            }
+        }
+        
+        [_roomInfoView didSelectRoomWithPixelTypes:_selectRegionPixelTypes];
+        // 隐藏基站外圈
+        _chargerAroundView.hidden = YES;
+    } else if (state == UWMapStateEditRegion) {
+        if (edit) {
+            if (!_selectRegionPixelTypes) {
+                _selectRegionPixelTypes = [NSMutableArray new];
+            }
+            [_selectRegionPixelTypes removeAllObjects];
+            [_roomInfoView didSelectRoomWithPixelTypes:_selectRegionPixelTypes];
+        } else {
+            [_selectRegionPixelTypes removeAllObjects];
+            // 取消高亮
+            __weak typeof(self) weakSelf = self;
+            [_viewModel highlightRoomWithPixelTypes:_selectRegionPixelTypes completion:^(UIImage * _Nonnull bitmap) {
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                [strongSelf updateMapImage:bitmap];
+                [strongSelf.roomInfoView didSelectRoomWithPixelTypes:strongSelf.selectRegionPixelTypes];
+                if (strongSelf.splitLineView) {
+                    [strongSelf.splitLineView removeFromSuperview];
+                    strongSelf.splitLineView = nil;
+                }
+            }];
+        }
+        // 隐藏基站外圈
+        _chargerAroundView.hidden = YES;
+    }
+}
+
+- (CGPoint)getViewPointWithMapPoint:(CGPoint)mapPoint {
+    // 相当于找出地图的点在屏幕上的位置（by xiely, 2023/12/07）
+    // 如果 RN 要的效果不是这个，后面再改
+    CGPoint viewPoint = [_mapImageView convertPoint:mapPoint toView:self];
+    return viewPoint;
+}
+
+/// 获取划区清扫的区域数据
+- (NSDictionary <NSNumber *, NSArray *> *)selectCleanAreaPointDict {
+    NSMutableDictionary *mutableDict = [NSMutableDictionary new];
+    for (UWRCTSelectCleanAreaView *view in _selectCleanViews) {
+        NSArray *points = [view getRectPoints];
+        [mutableDict setObject:points forKey:@(view.areaModel.areaId)];
+    }
+    return mutableDict.copy;
+}
+
+/// 获取禁区的区域数据
+- (NSDictionary <NSNumber *, NSArray *> *)forbiddenAreaPointsDict {
+    NSMutableDictionary *mutableDict = [NSMutableDictionary new];
+    for (UWRCTForbiddenAreaView *view in _forbiddenViews) {
+        NSArray *points = [view getRectPoints];
+        [mutableDict setObject:points forKey:@(view.areaModel.areaId)];
+    }
+    return mutableDict.copy;
+}
+
+/// 获取虚拟墙的区域数据
+- (NSDictionary <NSNumber *, NSArray *> *)virtualWallPointsDict {
+    NSMutableDictionary *mutableDict = [NSMutableDictionary new];
+    for (UWRCTVirtualWallView *view in _virtualWallViews) {
+        NSArray *points = [view getLinePoints];
+        [mutableDict setObject:points forKey:@(view.areaModel.areaId)];
+    }
+    return mutableDict.copy;
+}
+
+- (NSDictionary <NSNumber *, NSArray *> *)doorsillPointsDict {
+    NSMutableDictionary *mutableDict = [NSMutableDictionary new];
+    for (UWRCTDoorsillView *view in _doorsillViews) {
+        NSArray *points = [view getLinePoints];
+        [mutableDict setObject:points forKey:@(view.areaModel.areaId)];
+    }
+    return mutableDict.copy;
+}
+
+- (NSDictionary *)fixedPointDict {
+    if (_fixedPointInMap) {
+        return @{
+            @"id": @"appoint_0",
+            @"points": @{
+                @"x": @(_fixedPointInMap.CGPointValue.x),
+                @"y": @(_fixedPointInMap.CGPointValue.y)
+            }
+        };
+    } else {
+        return @{
+            @"id": @"appoint_0"
+        };
+    }
+}
+
+- (NSArray <NSString *> *)selectedPixelTypes {
+    return _selectRegionPixelTypes.count > 0 ? _selectRegionPixelTypes.copy : @[];
+}
+
+- (NSArray <NSDictionary *> *)roomSplitLineData {
+    UWRCTMapRoomInfo *roomInfo = _splitLineView.roomInfo;
+    NSArray *points = [_splitLineView getLinePoints];
+    return @[@{
+        @"pixel": roomInfo.roomPixelType,
+        @"points": points
+    }];
+}
+
+#pragma mark - Rotate Map
+
+- (void)viewModelDidRotateMap:(CGFloat)angle {
+    // 地图旋转
+    CGAffineTransform rotateTransform = CGAffineTransformMakeRotation(angle);
+    self.mapImageView.transform = rotateTransform;
+    
+    // 处理不随地图旋转的元素
+    for (UWRCTForbiddenAreaView *rectView in _forbiddenViews) {
+        rectView.mapRotateAngle = angle;
+        [rectView didRotate:0];
+    }
+    for (UWRCTVirtualWallView *lineView in _virtualWallViews) {
+        lineView.mapRotateAngle = angle;
+        [lineView didRotate:0];
+    }
+    for (UWRCTDoorsillView *doorsillView in _doorsillViews) {
+        doorsillView.mapRotateAngle = angle;
+        [doorsillView didRotate:0];
+    }
+    self.roomInfoView.mapRotateAngle = angle;
+    [self.roomInfoView didRotate:0];
+}
+
+
+#pragma mark - UIScrollView
+- (void)setupScrollView {
+    self.scrollView = [[UIScrollView alloc] init];
+    self.scrollView.backgroundColor = [UIColor clearColor];
+    self.scrollView.bouncesZoom = NO;
+    self.scrollView.minimumZoomScale = 1.0;
+    self.scrollView.maximumZoomScale = 4.0;
+    self.scrollView.multipleTouchEnabled = YES;
+    self.scrollView.delegate = self;
+    self.scrollView.userInteractionEnabled = YES;
+    self.scrollView.alwaysBounceVertical = NO;
+    self.scrollView.alwaysBounceHorizontal = NO;
+    self.scrollView.showsHorizontalScrollIndicator = NO;
+    self.scrollView.showsVerticalScrollIndicator = NO;
+    self.scrollView.scrollsToTop = NO;
+    self.scrollView.decelerationRate = UIScrollViewDecelerationRateFast;
+    self.scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
+    [self addSubview:self.scrollView];
+    [self.scrollView mas_makeConstraints:^(MASConstraintMaker *make) {
+        make.edges.equalTo(self);
+    }];
+}
+
+- (void)setupTapGesture {
+    UITapGestureRecognizer *tapGes = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleTap:)];
+    [self.scrollView addGestureRecognizer:tapGes];
+    
+    UITapGestureRecognizer *doubleTapGes = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleDoubleTap:)];
+    doubleTapGes.numberOfTapsRequired = 2;
+    [self.scrollView addGestureRecognizer:doubleTapGes];
+    
+    [tapGes requireGestureRecognizerToFail:doubleTapGes];
+}
+
+#pragma mark - UIScrollViewDelegate
+
+- (void)scrollViewWillBeginDragging:(UIScrollView *)scrollView {
+    for (UWRCTSelectCleanAreaView *view in _selectCleanViews) {
+        [view handleViewOutsideTap];
+    }
+    for (UWRCTForbiddenAreaView *view in _forbiddenViews) {
+        [view handleViewOutsideTap];
+    }
+    for (UWRCTVirtualWallView *view in _virtualWallViews) {
+        [view handleViewOutsideTap];
+    }
+    for (UWRCTDoorsillView *view in _doorsillViews) {
+        [view handleViewOutsideTap];
+    }
+}
+
+- (UIView *)viewForZoomingInScrollView:(UIScrollView *)scrollView {
+    return _contentView;
+}
+
+- (void)scrollViewWillBeginZooming:(UIScrollView *)scrollView withView:(UIView *)view {
+    scrollView.contentInset = UIEdgeInsetsZero;
+    CGFloat zoomScale = scrollView.zoomScale;
+    for (UWRCTSelectCleanAreaView *rectView in _selectCleanViews) {
+        [rectView didBeginZoomWithScale:zoomScale];
+    }
+    for (UWRCTForbiddenAreaView *rectView in _forbiddenViews) {
+        [rectView didBeginZoomWithScale:zoomScale];
+    }
+    for (UWRCTVirtualWallView *lineView in _virtualWallViews) {
+        [lineView didBeginZoomWithScale:zoomScale];
+    }
+    for (UWRCTDoorsillView *doorsillView in _doorsillViews) {
+        [doorsillView didBeginZoomWithScale:zoomScale];
+    }
+    [_splitLineView didBeginZoomWithScale:zoomScale];
+    [_roomInfoView didBeginZoomWithScale:zoomScale];
+    [_pathView didBeginZoomWithScale:zoomScale];
+    [_robotBreathView didBeginZoomWithScale:zoomScale];
+}
+
+- (void)scrollViewDidZoom:(UIScrollView *)scrollView {
+    [self refreshImageContainerViewCenter];
+    
+    CGFloat zoomScale = scrollView.zoomScale;
+    for (UWRCTSelectCleanAreaView *rectView in _selectCleanViews) {
+        [rectView updateZoomScale:zoomScale];
+    }
+    for (UWRCTForbiddenAreaView *rectView in _forbiddenViews) {
+        [rectView updateZoomScale:zoomScale];
+    }
+    for (UWRCTVirtualWallView *lineView in _virtualWallViews) {
+        [lineView updateZoomScale:zoomScale];
+    }
+    for (UWRCTDoorsillView *doorsillView in _doorsillViews) {
+        [doorsillView updateZoomScale:zoomScale];
+    }
+    [_splitLineView updateZoomScale:zoomScale];
+    [_roomInfoView updateZoomScale:zoomScale];
+    [_pathView updateZoomScale:zoomScale];
+    
+    // 根据地图缩放系数反向缩放图标
+    CGFloat reverseScale = 1.0 / zoomScale;
+//    _pileTrayIconImageView.transform = CGAffineTransformConcat(CGAffineTransformMakeScale(reverseScale, reverseScale),
+//                                                               CGAffineTransformMakeRotation(_chargerAngle));
+    [_robotBreathView updateZoomScale:zoomScale];
+//    _pileIconImageView.transform = CGAffineTransformConcat(CGAffineTransformMakeScale(reverseScale, reverseScale),
+//                                                           CGAffineTransformMakeRotation(_chargerAngle));
+    
+    _pileTrayIconImageView.transform = CGAffineTransformMakeRotation(_chargerAngle);
+    _pileIconImageView.transform = CGAffineTransformMakeRotation(_chargerAngle);
+    
+    _chargerAroundLineLayer.lineWidth = 3.0 * reverseScale;
+    _chargerAroundLineLayer.lineDashPattern = @[@(6.0 * reverseScale), @(6.0 * reverseScale)];
+    
+    // 更新扫地机状态
+    CGFloat robotAngle = [_viewModel robotAngle];
+//    _robotView.transform = CGAffineTransformConcat(CGAffineTransformMakeScale(reverseScale, reverseScale), CGAffineTransformMakeRotation(robotAngle));
+    _robotView.transform = CGAffineTransformMakeRotation(robotAngle);
+    
+    // 处理定点图标在地图缩放时的位置问题
+    _fixedPointImageView.transform = CGAffineTransformMakeScale(reverseScale, reverseScale);
+    CGPoint pointCleanPoint = [self currentPointCleanPoint];
+    CGFloat fixedPointCenterX = pointCleanPoint.x;
+    CGFloat fixedPointCenterY = pointCleanPoint.y - (_fixedPointImageView.bounds.size.height / 2.0) * reverseScale;
+    _fixedPointImageView.center = CGPointMake(fixedPointCenterX, fixedPointCenterY);
+#if DEBUG
+    _debugRedTapPoint.transform = CGAffineTransformMakeScale(reverseScale, reverseScale);
+#endif
+}
+
+- (void)scrollViewDidEndZooming:(UIScrollView *)scrollView withView:(UIView *)view atScale:(CGFloat)scale {
+    [self refreshImageContainerViewCenter];
+    
+    CGFloat zoomScale = scrollView.zoomScale;
+    for (UWRCTSelectCleanAreaView *rectView in _selectCleanViews) {
+        [rectView didEndZoomWithScale:zoomScale];
+    }
+    for (UWRCTForbiddenAreaView *rectView in _forbiddenViews) {
+        [rectView didEndZoomWithScale:zoomScale];
+    }
+    for (UWRCTVirtualWallView *lineView in _virtualWallViews) {
+        [lineView didEndZoomWithScale:zoomScale];
+    }
+    for (UWRCTDoorsillView *doorsillView in _doorsillViews) {
+        [doorsillView didEndZoomWithScale:zoomScale];
+    }
+    [_splitLineView didEndZoomWithScale:zoomScale];
+    [_roomInfoView didEndZoomWithScale:zoomScale];
+    [_pathView didEndZoomWithScale:zoomScale];
+    
+    CGFloat reverseScale = 1.0 / zoomScale;
+//    _pileTrayIconImageView.transform = CGAffineTransformConcat(CGAffineTransformMakeScale(reverseScale, reverseScale),
+//                                                               CGAffineTransformMakeRotation(_chargerAngle));
+    [_robotBreathView didEndZoomWithScale:zoomScale];
+//    _pileIconImageView.transform = CGAffineTransformConcat(CGAffineTransformMakeScale(reverseScale, reverseScale),
+//                                                           CGAffineTransformMakeRotation(_chargerAngle));
+    
+    _pileTrayIconImageView.transform = CGAffineTransformMakeRotation(_chargerAngle);
+    _pileIconImageView.transform = CGAffineTransformMakeRotation(_chargerAngle);
+    // 更新扫地机状态
+//    CGFloat robotAngle = [_viewModel robotAngle];
+//    _robotView.transform = CGAffineTransformConcat(CGAffineTransformMakeScale(reverseScale, reverseScale), CGAffineTransformMakeRotation(robotAngle));
+    // 更新扫地机状态
+    CGFloat robotAngle = [_viewModel robotAngle];
+//    _robotView.transform = CGAffineTransformConcat(CGAffineTransformMakeScale(reverseScale, reverseScale), CGAffineTransformMakeRotation(robotAngle));
+    _robotView.transform = CGAffineTransformMakeRotation(robotAngle);
+    
+    _fixedPointImageView.transform = CGAffineTransformMakeScale(reverseScale, reverseScale);
+    CGPoint pointCleanPoint = [self currentPointCleanPoint];
+    CGFloat fixedPointCenterX = pointCleanPoint.x;
+    CGFloat fixedPointCenterY = pointCleanPoint.y - (_fixedPointImageView.bounds.size.height / 2.0) * reverseScale;
+    _fixedPointImageView.center = CGPointMake(fixedPointCenterX, fixedPointCenterY);
+    
+#if DEBUG
+    _debugRedTapPoint.transform = CGAffineTransformMakeScale(reverseScale, reverseScale);
+#endif
+}
+
+- (void)refreshImageContainerViewCenter {
+//    NSLog(@"scrollView(bounds:(%.2lf, %.2lf, %.2lf, %.2lf), frame:(%.2lf, %.2lf, %.2lf, %.2lf), contentSize:(%.2lf, %.2lf), center:(%.2lf, %.2lf), anchorPoint:(%.2lf, %.2lf))",
+//          _scrollView.bounds.origin.x, _scrollView.bounds.origin.y, _scrollView.bounds.size.width, _scrollView.bounds.size.height,
+//          _scrollView.frame.origin.x, _scrollView.frame.origin.y, _scrollView.frame.size.width, _scrollView.frame.size.height,
+//          _scrollView.contentSize.width, _scrollView.contentSize.height,
+//          _scrollView.center.x, _scrollView.center.y,
+//          _scrollView.layer.anchorPoint.x, _scrollView.layer.anchorPoint.y);
+//    NSLog(@"contentView(bounds:(%.2lf, %.2lf, %.2lf, %.2lf), frame:(%.2lf, %.2lf, %.2lf, %.2lf), center:(%.2lf, %.2lf), anchorPoint:(%.2lf, %.2lf))",
+//          _contentView.bounds.origin.x, _contentView.bounds.origin.y, _contentView.bounds.size.width, _contentView.bounds.size.height,
+//          _contentView.frame.origin.x, _contentView.frame.origin.y, _contentView.frame.size.width, _contentView.frame.size.height,
+//          _contentView.center.x, _contentView.center.y,
+//          _contentView.layer.anchorPoint.x, _contentView.layer.anchorPoint.y);
+    CGFloat offsetX = (self.scrollView.bounds.size.width > self.scrollView.contentSize.width) ? ((self.scrollView.bounds.size.width - self.scrollView.contentSize.width) * 0.5) : 0.0;
+    CGFloat offsetY = (self.scrollView.bounds.size.height > self.scrollView.contentSize.height) ? ((self.scrollView.bounds.size.height - self.scrollView.contentSize.height) * 0.5) : 0.0;
+    self.contentView.center = CGPointMake(self.scrollView.contentSize.width * 0.5 + offsetX, self.scrollView.contentSize.height * 0.5 + offsetY);
+}
+
+#pragma mark - Action
+
+/// UIScrollView 的单击事件
+/// - Parameter tapGes: 单击手势
+- (void)handleTap:(UITapGestureRecognizer *)tapGes {
+    
+    // 获取点击位置在 UIScrollView 中的坐标
+    CGPoint locationInScrollView = [tapGes locationInView:self.scrollView];
+    // 将点击位置从 UIScrollView 的坐标系转换到 UIImageView 的坐标系
+    CGPoint locationInMapImageView = [self.scrollView convertPoint:locationInScrollView toView:self.mapImageView];
+    
+#if DEBUG
+    // 显示当前点击的点在地图的位置
+    _debugRedTapPoint.center = locationInMapImageView;
+    _debugRedTapPoint.hidden = NO;
+    [_mapImageView bringSubviewToFront:_debugRedTapPoint];
+#endif
+    if (self.viewModel.mapState == UWMapStateNormal) {
+        return;
+    }
+    
+    for (UWRCTSelectCleanAreaView *view in _selectCleanViews) {
+        [view handleViewOutsideTap];
+    }
+    for (UWRCTForbiddenAreaView *view in _forbiddenViews) {
+        [view handleViewOutsideTap];
+    }
+    for (UWRCTVirtualWallView *view in _virtualWallViews) {
+        [view handleViewOutsideTap];
+    }
+    for (UWRCTDoorsillView *view in _doorsillViews) {
+        [view handleViewOutsideTap];
+    }
+    
+    // 先清空定点清扫的数据
+    _fixedPointInMap = nil;
+    if (_viewModel.mapState == UWMapStateFixedPoint && _viewModel.isEdit) {
+//        CGFloat reverseScale = 1.0 / _scrollView.zoomScale;
+//        CGFloat fixedPointHeight = _fixedPointImageView.bounds.size.height * reverseScale;
+        CGFloat centerX = locationInMapImageView.x;
+        CGFloat centerY = locationInMapImageView.y - (_fixedPointImageView.bounds.size.height / 2.0) * (1 / _scrollView.zoomScale);
+//        CGFloat centerY = locationInMapImageView.y - fixedPointHeight / 2.0;
+        _fixedPointImageView.center = CGPointMake(centerX, centerY);
+        _fixedPointImageView.hidden = NO;
+        _fixedPointInMap = [NSValue valueWithCGPoint:locationInMapImageView];
+    }
+    
+    if (!CGRectContainsPoint(self.mapImageView.bounds, locationInMapImageView)) {
+        return;
+    }
+    
+    // 把点击的点坐标记录下来
+    _lastTapPointInMap = locationInMapImageView;
+    
+    if ([self isSelectCleanAreaHandleTap:locationInScrollView]) {
+        return;
+    }
+    if ([self isForbiddenAreaHandleTap:locationInScrollView]) {
+        return;
+    }
+    if ([self isVirtualWallHandleTap:locationInScrollView]) {
+        return;
+    }
+    if ([self isDoorsillHandleTap:locationInScrollView]) {
+        return;
+    }
+    
+    CGPoint locationInBitmap = locationInMapImageView;
+    CGFloat zoomScale = self.scrollView.zoomScale;
+    NSString *pixelType = [self.viewModel pixelTypeWithPoint:locationInBitmap
+                                                     mapSize:self.mapImageView.image.size
+                                                   zoomScale:zoomScale];
+    BOOL isValidHighlightArea = [self.viewModel isTapOnValidHighlightArea:pixelType];
+    if (!isValidHighlightArea) {
+        NSLog(@"点击了不可高亮的区域: %@", pixelType);
+        return;
+    }
+    
+    NSLog(@"点击了可高亮的区域：%@ | mapState: %@", pixelType, NSStringFromUWMapState(_viewModel.mapState));
+    
+    if (_viewModel.mapState == UWMapStateFixedPoint) {
+        _fixedPointImageView.hidden = NO;
+        if (_viewModel.isEdit) {
+//            CGFloat reverseScale = 1.0 / _scrollView.zoomScale;
+//            CGFloat fixedPointHeight = _fixedPointImageView.bounds.size.height * reverseScale;
+            CGFloat centerX = locationInMapImageView.x;
+            CGFloat centerY = locationInMapImageView.y - (_fixedPointImageView.bounds.size.height / 2.0) * (1 / _scrollView.zoomScale);
+            
+            /**
+             定点清扫 icon 底部尖尖的点要落在手指点击的位置，所以要减去 _fixedPointImageView.bounds.size.height / 2.0 的高度
+             这个点击的位置也是回传给RN/固件的点
+             */
+            _fixedPointImageView.center = CGPointMake(centerX, centerY);
+            _fixedPointInMap = [NSValue valueWithCGPoint:locationInMapImageView];
+        }
+        
+    }  else if (_viewModel.mapState == UWMapStateEditRegion) {
+        // 点击分区
+        if (_viewModel.editRegionState == UWMapEditRegionStateClick) {
+            UWRCTMapRoomInfo *roomInfo = _viewModel.mapModel.mapData.roomInfo[pixelType];
+            NSString *extendJsonStr = roomInfo.extendStr;
+            _viewModel.onClickSplitArea(pixelType, extendJsonStr);
+        }
+        // 合并分区
+        else if (_viewModel.editRegionState == UWMapEditRegionStateMerge) {
+            // 使用 onClickSplitArea 回调给 RN
+            if ([_selectRegionPixelTypes containsObject:pixelType]) {
+                [_selectRegionPixelTypes removeObject:pixelType];
+            } else {
+                [_selectRegionPixelTypes addObject:pixelType];
+            }
+            // 只能选两个分区来合并
+            if (_selectRegionPixelTypes.count > 2) {
+                [_selectRegionPixelTypes removeObjectsInRange:NSMakeRange(0, _selectRegionPixelTypes.count - 2)];
+            }
+            __weak typeof(self) weakSelf = self;
+            [_viewModel highlightRoomWithPixelTypes:_selectRegionPixelTypes completion:^(UIImage * _Nonnull bitmap) {
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                [strongSelf updateMapImage:bitmap];
+                [strongSelf.roomInfoView didSelectRoomWithPixelTypes:strongSelf.selectRegionPixelTypes];
+                UWRCTMapRoomInfo *roomInfo = strongSelf.viewModel.mapModel.mapData.roomInfo[pixelType];
+                NSString *extendJsonStr = roomInfo.extendStr;
+                strongSelf.viewModel.onClickSplitArea(pixelType, extendJsonStr);
+            }];
+        }
+        // 分割区域
+        else if (_viewModel.editRegionState == UWMapEditRegionStateSplit) {
+            // 分割区域只能选择一个分区
+            [_selectRegionPixelTypes removeAllObjects];
+            [_selectRegionPixelTypes addObject:pixelType];
+            __weak typeof(self) weakSelf = self;
+            [_viewModel highlightRoomWithPixelTypes:_selectRegionPixelTypes completion:^(UIImage * _Nonnull bitmap) {
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                [strongSelf updateMapImage:bitmap];
+                [strongSelf.roomInfoView didSelectRoomWithPixelTypes:strongSelf.selectRegionPixelTypes];
+                UWRCTMapRoomInfo *roomInfo = strongSelf.viewModel.mapModel.mapData.roomInfo[pixelType];
+                NSString *extendJsonStr = roomInfo.extendStr;
+                strongSelf.viewModel.onClickSplitArea(pixelType, extendJsonStr);
+                CGPoint pointInArea = CGPointMake(locationInBitmap.x, locationInBitmap.y);
+                [strongSelf addSplitLineViewWithRoomInfo:roomInfo point:pointInArea];
+            }];
+        }
+        /// 划区清扫中，且处于编辑状态时，才去处理选中与非选中的状态，通过 isEdit 来判断机器是否处于划区清扫中，如果在清扫中则不能再点选区域 (by xiely, 2024/6/6)
+    } else if (_viewModel.mapState == UWMapStateSelectRegion && _viewModel.isEdit) {
+        // 使用 onClickRoom 回调给 RN
+        if ([_selectRegionPixelTypes containsObject:pixelType]) {
+            [_selectRegionPixelTypes removeObject:pixelType];
+            _viewModel.onClickRoom(pixelType, NO);
+        } else {
+            [_selectRegionPixelTypes addObject:pixelType];
+            _viewModel.onClickRoom(pixelType, YES);
+        }
+//        [_roomInfoView didSelectRoomWithPixelTypes:_selectRegionPixelTypes];
+    }
+}
+
+- (void)handleDoubleTap:(UITapGestureRecognizer *)gesture {
+    CGFloat suitableRatio = [self suitableRatio];
+    [_scrollView setZoomScale:suitableRatio animated:YES];
+    [self setContentViewCenterAlignWithAnimated:YES];
+}
+
+- (BOOL)isSelectCleanAreaHandleTap:(CGPoint)locationInScrollView {
+    if (_viewModel.mapState != UWMapStateSelectArea) {
+        return NO;
+    }
+    
+    // 倒序遍历禁区，检测用户点击的是否是禁区区域
+    __block BOOL isTapArea = NO;
+    [self.selectCleanViews enumerateObjectsWithOptions:NSEnumerationReverse usingBlock:^(UWRCTSelectCleanAreaView * _Nonnull obj, NSUInteger idx, BOOL * _Nonnull stop) {
+        CGPoint locationInForbiddenView = [self.scrollView convertPoint:locationInScrollView toView:obj];
+        if (CGRectContainsPoint(obj.bounds, locationInForbiddenView)) {
+            isTapArea = YES;
+            [obj handleViewTap];
+            *stop = YES;
+            // 点击当前禁区后，改其它禁区的状态
+            for (UWRCTSelectCleanAreaView *otherView in self.selectCleanViews) {
+                if (otherView != obj) {
+                    if (self.viewModel.mapState == UWMapStateSelectArea) {
+                        [otherView prepareEdit];
+                    } else {
+                        [otherView endEdit];
+                    }
+                }
+            }
+        }
+    }];
+    return isTapArea;
+}
+
+- (BOOL)isForbiddenAreaHandleTap:(CGPoint)locationInScrollView {
+    if (_viewModel.mapState != UWMapStateForbiddenArea) {
+        return NO;
+    }
+    
+    // 倒序遍历禁区，检测用户点击的是否是禁区区域
+    __block BOOL isTapArea = NO;
+    [self.forbiddenViews enumerateObjectsWithOptions:NSEnumerationReverse usingBlock:^(UWRCTForbiddenAreaView * _Nonnull obj, NSUInteger idx, BOOL * _Nonnull stop) {
+        CGPoint locationInForbiddenView = [self.scrollView convertPoint:locationInScrollView toView:obj];
+        if (CGRectContainsPoint(obj.bounds, locationInForbiddenView)) {
+            isTapArea = YES;
+            [obj handleViewTap];
+            *stop = YES;
+            // 点击当前禁区后，改其它禁区的状态
+            for (UWRCTForbiddenAreaView *otherView in self.forbiddenViews) {
+                if (otherView != obj) {
+                    if (self.viewModel.mapState == UWMapStateForbiddenArea) {
+                        [otherView prepareEdit];
+                    } else {
+                        [otherView endEdit];
+                    }
+                }
+            }
+        }
+    }];
+    return isTapArea;
+}
+
+- (BOOL)isVirtualWallHandleTap:(CGPoint)locationInScrollView {
+    if (_viewModel.mapState != UWMapStateVirtualWall) {
+        return NO;
+    }
+    
+    __block BOOL isTapArea = NO;
+    [self.virtualWallViews enumerateObjectsWithOptions:NSEnumerationReverse usingBlock:^(UWRCTVirtualWallView * _Nonnull obj, NSUInteger idx, BOOL * _Nonnull stop) {
+        CGPoint locationInForbiddenView = [self.scrollView convertPoint:locationInScrollView toView:obj];
+        if (CGRectContainsPoint(obj.bounds, locationInForbiddenView)) {
+            isTapArea = YES;
+            [obj handleViewTap];
+            *stop = YES;
+            // 点击当前禁区后，改其它禁区的状态
+            for (UWRCTVirtualWallView *otherVirtualWall in self.virtualWallViews) {
+                if (otherVirtualWall != obj) {
+                    if (self.viewModel.mapState == UWMapStateVirtualWall) {
+                        [otherVirtualWall prepareEdit];
+                    } else {
+                        [otherVirtualWall endEdit];
+                    }
+                }
+            }
+        }
+    }];
+    return isTapArea;
+}
+
+- (BOOL)isDoorsillHandleTap:(CGPoint)locationInScrollView {
+    if (_viewModel.mapState != UWMapStateDoorsill) {
+        return NO;
+    }
+    
+    __block BOOL isTapArea = NO;
+    [_doorsillViews enumerateObjectsWithOptions:NSEnumerationReverse usingBlock:^(UWRCTDoorsillView * _Nonnull obj, NSUInteger idx, BOOL * _Nonnull stop) {
+        CGPoint locationInDoorsillView = [self.scrollView convertPoint:locationInScrollView toView:obj];
+        if (CGRectContainsPoint(obj.bounds, locationInDoorsillView)) {
+            isTapArea = YES;
+            [obj handleViewTap];
+            *stop = YES;
+        }
+    }];
+    return isTapArea;
+}
+
+/// 定点状态下，点击了地图上的一个点
+- (void)fixedPointDidTap:(CGPoint)locationInMap locationInBitmap:(CGPoint)locationInBitmap {
+    
+}
+
+- (void)addSplitLineViewWithRoomInfo:(UWRCTMapRoomInfo *)roomInfo point:(CGPoint)point {
+    if (_splitLineView) {
+        [_splitLineView removeFromSuperview];
+        _splitLineView = nil;
+    }
+    
+    NSString *pixelType = roomInfo.roomPixelType;
+    NSArray *points = [_viewModel.mapModel.mapData.pixelTypePointsMap objectForKey:pixelType];
+    if (points.count == 0) { return; }
+    CGFloat minX = CGFLOAT_MAX;
+    CGFloat maxX = CGFLOAT_MIN;
+    for (NSValue *itemValue in points) {
+        CGPoint item = [itemValue CGPointValue];
+        CGFloat itemY = round(item.y);
+        CGFloat pointY = round(point.y);
+        if (fabs(itemY - pointY) < 0.01) {
+            if (item.x < minX) {
+                minX = item.x;
+            } else if (item.x > maxX) {
+                maxX = item.x;
+            }
+        }
+    }
+    _splitLineView = [[UWRCTSplitLineView alloc] initWithRoomInfo:roomInfo
+                                                      pixelPoints:points
+                                                        leftPoint:CGPointMake(minX, point.y)
+                                                        rightPoint:CGPointMake(maxX, point.y)
+                                                         mapOrigin:CGPointZero];
+    _splitLineView.zoomScale = self.scrollView.zoomScale;
+    [_splitLineView applyTransform];
+    [_mapImageView addSubview:_splitLineView];
+}
+
+#pragma mark - 地图 bitmap
+
+- (void)setupContentView {
+    // 重新建图后，contentView 的 size 可能为 (0, 0)
+    if (_contentView) {
+        [_contentView removeFromSuperview];
+        _contentView = nil;
+    }
+    CGFloat contentViewWidth = self.scrollView.frame.size.width * 3;
+    CGFloat contentViewHeight = self.scrollView.frame.size.height * 3;
+    
+    _contentView = [[UIView alloc] init];
+    _contentView.bounds = CGRectMake(0, 0, contentViewWidth, contentViewHeight);
+    _contentView.center = CGPointMake(CGRectGetWidth(_scrollView.frame) / 2.0,
+                                          CGRectGetHeight(_scrollView.frame) / 2.0);
+    _contentView.backgroundColor = [UIColor clearColor];
+    [_scrollView addSubview:_contentView];
+}
+
+- (void)setupMapView {
+    CGFloat contentViewWidth = _contentView.bounds.size.width;
+    CGFloat contentViewHeight = _contentView.bounds.size.height;
+    CGFloat mapImageViewX = (contentViewWidth - _viewModel.mapWidth) / 2.0;
+    CGFloat mapImageViewY = (contentViewHeight - _viewModel.mapHeight) / 2.0;
+    
+    UIImage *mapImage = [_viewModel mapBitmapImage];
+    _mapImageView = [[UWMapImageView alloc] initWithImage:mapImage];
+    _mapImageView.frame = CGRectMake(mapImageViewX, mapImageViewY, _viewModel.mapWidth, _viewModel.mapHeight);
+    _mapImageView.backgroundColor = [UIColor clearColor];
+    _mapImageView.userInteractionEnabled = YES;
+    _mapImageView.contentMode = UIViewContentModeScaleAspectFit;
+    _mapImageView.layer.magnificationFilter = kCAFilterNearest;
+//#if DEBUG
+//    _mapImageView.layer.borderColor = [UIColor redColor].CGColor;
+//    _mapImageView.layer.borderWidth = 1.0;
+//#endif
+    [_contentView addSubview:_mapImageView];
+}
+
+- (void)updateMapImage:(UIImage *)mapImage {
+    self.mapImageView.image = mapImage;
+}
+
+#pragma mark - 路线
+
+- (void)setupPathView {
+    if (_pathView) {
+        [_pathView removeFromSuperview];
+        _pathView = nil;
+    }
+    
+    CGRect frame = CGRectMake(0, 0, _viewModel.mapWidth, _viewModel.mapHeight);
+    _pathView = [[UWRCTPathView alloc] initWithFrame:frame
+                                           zoomScale:_scrollView.zoomScale
+                                           mapOrigin:_viewModel.mapOrigin
+                                           pathWidth:_viewModel.mapModel.pathWidth
+                                            pathData:_viewModel.mapModel.pathData];
+    [self.mapImageView addSubview:_pathView];
+    self.robotView.center = _viewModel.robotPosition;
+    // pathData 为空时，需要隐藏机器人图标
+    self.robotView.hidden = _viewModel.mapModel.pathData.count == 0;
+    [self setNeedsLayout];
+}
+
+- (void)updateRobotBreathViewState {
+    if (!_robotBreathView) {
+        _robotBreathView = [[UWMapRobotBreathView alloc] init];
+        _robotBreathView.bounds = _robotView.bounds;
+        _robotBreathView.center = _viewModel.robotPosition;
+        [_mapImageView insertSubview:_robotBreathView belowSubview:_robotView];
+    }
+    /**
+     获取路径最后一个点来判断是否要显示机器人的呼吸动画
+     如果不存在或 lastPoint.hidden == YES，则隐藏呼吸圈
+     如果存在且 lastPoint.hidden == NO，则显示呼吸圈
+     */
+    UWRCTMapRoutePoint *lastPoint = _viewModel.mapModel.pathData.lastObject;
+    if (!lastPoint) {
+        // 隐藏呼吸圈
+        _robotBreathView.center = _viewModel.robotPosition;
+        _robotBreathView.hidden = YES;
+        return;
+    }
+    
+    // 记录充电桩和机器人的位置
+    NSLog(@"[UWMapView updateRobotBreathViewState] robotPosition: (%.2lf, %.2lf), chargerPosition: (%.2lf, %.2lf)",
+          _viewModel.robotPosition.x, _viewModel.robotPosition.y,
+          _viewModel.chargerPosition.x, _viewModel.chargerPosition.y);
+    
+    // 设置呼吸圈的颜色
+    _robotBreathView.backgroundColor = [UIColor uw_colorWithARGBHex:lastPoint.bgColor];
+    // 首次进入时，scrollView.zoomScale 是 1.0，此时开始动画的话，呼吸圈缩放大小异常
+    CGFloat scale = _scrollView.zoomScale;
+    if (scale == 1.0) {
+        scale = [self suitableRatio];
+    }
+    /**
+     呼吸圈的原始大小与机器人原始大小一致，呼吸圈动画的放大倍数由 RN 控制
+     机器人默认长宽是(24, 24)，假设机器人换了 icon 后长宽变了，为了防止呼吸圈大小和圆角半径与机器人对不上，需要主动改呼吸圈的 bounds、layer.cornerRadius
+     呼吸圈的位置跟着机器人走，所以 robotBreathView.center 是 robotPosition
+     */
+    _robotBreathView.bounds = _robotView.bounds;
+    _robotBreathView.layer.cornerRadius = _robotView.bounds.size.width / 2.0;
+    _robotBreathView.center = _viewModel.robotPosition;
+    // 按当前 scrollView 缩放倍数去缩放呼吸圈
+    [_robotBreathView updateZoomScale:scale];
+    _robotBreathView.hidden = lastPoint.hidden;
+    
+    if (!lastPoint.hidden) {
+        /**
+         开始呼吸动画
+         等主线程下一周期再开始动画，否则呼吸圈缩放大小有异常，暂未查明原因。
+        */
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self.robotBreathView startAnimationWithDuration:lastPoint.duration rate:lastPoint.rate];
+        });
+    } else {
+        // 停止呼吸动画
+        [_robotBreathView stopAnimation];
+    }
+}
+
+#pragma mark - 房间信息
+
+- (void)setupRoomInfoView {
+    NSDictionary *roomInfo = _viewModel.mapModel.mapData.roomInfo;
+    if (_roomInfoView) {
+        [_roomInfoView removeFromSuperview];
+        _roomInfoView = nil;
+    }
+    if (roomInfo.count == 0) {
+        return;
+    }
+    
+    CGRect frame = CGRectMake(0, 0, _viewModel.mapWidth, _viewModel.mapHeight);
+    _roomInfoView = [[UWRCTRoomInfoView alloc] initWithFrame:frame roomInfo:roomInfo];
+    [_mapImageView addSubview:_roomInfoView];
+    // 建图完成后才创建的话，此时可能地图处于放大或缩小状态，需要用当前放大倍数去更新房间信息视图
+    [_roomInfoView updateZoomScale:_scrollView.zoomScale];
+}
+
+- (void)updateRoomInfoView {
+    if (!_roomInfoView) {
+        [self setupRoomInfoView];
+    } else {
+        // 当地图长宽变化时，刷新
+        CGRect bounds = CGRectMake(0, 0, _viewModel.mapWidth, _viewModel.mapHeight);
+        _roomInfoView.bounds = bounds;
+        _roomInfoView.center = CGPointMake(_roomInfoView.superview.bounds.size.width / 2.0, _roomInfoView.superview.bounds.size.height / 2.0);
+        [_roomInfoView updateWithRoomInfo:_viewModel.mapModel.mapData.roomInfo];
+        [_roomInfoView updateZoomScale:_scrollView.zoomScale];
+        [self setNeedsLayout];
+    }
+}
+
+#pragma mark - 定点清扫
+
+- (void)updatePointCleanArea {
+    UWRCTMapAreaPointClean *pointCleanModel = [_viewModel pointCleanAreaModel];
+    if (pointCleanModel) {
+        // 处理定点图标在地图缩放时的位置问题
+        CGFloat reverseScale = 1.0 / _scrollView.zoomScale;
+        _fixedPointImageView.transform = CGAffineTransformMakeScale(reverseScale, reverseScale);
+        CGFloat fixedPointCenterX = pointCleanModel.point.x + _viewModel.mapOrigin.x;
+        CGFloat fixedPointCenterY = pointCleanModel.point.y + _viewModel.mapOrigin.y - _fixedPointImageView.bounds.size.height / 2.0;
+        _fixedPointImageView.center = CGPointMake(fixedPointCenterX, fixedPointCenterY);
+        _fixedPointImageView.hidden = (_viewModel.mapState != UWMapStateFixedPoint);
+    }
+}
+
+- (CGPoint)currentPointCleanPoint {
+    if (_viewModel.mapState == UWMapStateFixedPoint) {
+        CGPoint point = CGPointZero;
+        if (_viewModel.isEdit) {
+            if (_fixedPointInMap) {
+                return [_fixedPointInMap CGPointValue];
+            }
+        }
+        
+        UWRCTMapAreaPointClean *pointCleanModel = [_viewModel pointCleanAreaModel];
+        if (pointCleanModel) {
+            CGFloat fixedPointCenterX = pointCleanModel.point.x + _viewModel.mapOrigin.x;
+            CGFloat fixedPointCenterY = pointCleanModel.point.y + _viewModel.mapOrigin.y;
+            point = CGPointMake(fixedPointCenterX, fixedPointCenterY);
+        }
+        
+        
+        return point;
+    }
+    return CGPointZero;
+}
+
+#pragma mark - 选区
+
+- (void)setupSelectCleanArea {
+    for (UWRCTSelectCleanAreaView *item in _selectCleanViews) {
+        [item removeFromSuperview];
+    }
+    [_selectCleanViews removeAllObjects];
+    
+    NSArray *selectCleanAreas = [self.viewModel selectCleanAreaModels];
+    if (selectCleanAreas.count == 0) {
+        return;
+    }
+    if (!self.selectCleanViews) {
+        self.selectCleanViews = [NSMutableArray new];
+    }
+    for (UWRCTMapAreaSelectClean *selectCleanArea in selectCleanAreas) {
+        UWRCTSelectCleanAreaView *selectCleanView = [[UWRCTSelectCleanAreaView alloc] initWithAreaModel:selectCleanArea
+                                                                                             factorInfo:self.viewModel.mapModel.factorInfo
+                                                                                              mapOrigin:self.viewModel.mapOrigin];
+        selectCleanView.areaViewDelegate = self;
+        selectCleanView.scrollView = self.scrollView;
+        __weak typeof(self) weakSelf = self;
+        selectCleanView.beginEditHandle = ^(UWRCTSelectCleanAreaView * _Nonnull view) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            for (UWRCTSelectCleanAreaView *item in strongSelf.selectCleanViews) {
+                if (![item isEqual:view]) {
+                    [item prepareEdit];
+                }
+            }
+            [strongSelf.mapImageView bringSubviewToFront:view];
+        };
+        selectCleanView.editDoneHandle = ^(UWRCTSelectCleanAreaView * _Nonnull view) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            NSArray *points = [view getRectRelativePoints];
+            UWRCTMapAreaSelectClean *model = view.areaModel;
+            NSDictionary *params = @{
+                @"type": @(model.type),
+                @"extend": @{},
+                @"data": points
+            };
+            strongSelf.viewModel.onMapPointsDataChange(params);
+        };
+        [self.mapImageView addSubview:selectCleanView];
+        [self.selectCleanViews addObject:selectCleanView];
+    }
+    
+    if (self.viewModel.mapState == UWMapStateSelectArea) {
+        for (UWRCTSelectCleanAreaView *item in self.selectCleanViews) {
+            if (_viewModel.isEdit) {
+                if (item.areaModel._isNewAdded) {
+                    [item beginEdit];
+                } else {
+                    [item prepareEdit];
+                }
+            } else {
+                [item endEdit];
+            }
+        }
+    }
+    
+    for (UWRCTSelectCleanAreaView *view in _selectCleanViews) {
+        [view updateZoomScale:_scrollView.zoomScale];
+    }
+}
+
+#pragma mark - 禁区
+
+- (void)setupForbiddenArea {
+    for (UWRCTForbiddenAreaView *item in _forbiddenViews) {
+        [item removeFromSuperview];
+    }
+    [_forbiddenViews removeAllObjects];
+    
+    NSArray *forbiddenAreas = [self.viewModel forbiddelAreaModels];
+    if (forbiddenAreas.count == 0) {
+        return;
+    }
+    if (!self.forbiddenViews) {
+        self.forbiddenViews = [NSMutableArray new];
+    }
+    for (UWRCTMapAreaForbidden *forbiddenArea in forbiddenAreas) {
+        UWRCTForbiddenAreaView *forbiddenView = [[UWRCTForbiddenAreaView alloc] initWithAreaModel:forbiddenArea
+                                                                                       factorInfo:self.viewModel.mapModel.factorInfo
+                                                                                        mapOrigin:self.viewModel.mapOrigin];
+        forbiddenView.areaViewDelegate = self;
+        forbiddenView.scrollView = self.scrollView;
+        __weak typeof(self) weakSelf = self;
+        forbiddenView.beginEditHandle = ^(UWRCTForbiddenAreaView * _Nonnull view) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            for (UWRCTForbiddenAreaView *item in strongSelf.forbiddenViews) {
+                if (![item isEqual:view]) {
+                    [item prepareEdit];
+                }
+            }
+            [strongSelf.mapImageView bringSubviewToFront:view];
+        };
+        forbiddenView.editDoneHandle = ^(UWRCTForbiddenAreaView * _Nonnull view) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            NSArray *points = [view getRectRelativePoints];
+            UWRCTMapAreaForbidden *model = view.areaModel;
+            NSDictionary *params = @{
+                @"type": @(model.type),
+                @"extend": model.extend,
+                @"data": points
+            };
+            strongSelf.viewModel.onMapPointsDataChange(params);
+        };
+        [self.mapImageView addSubview:forbiddenView];
+        [self.forbiddenViews addObject:forbiddenView];
+    }
+    
+    if (self.viewModel.mapState == UWMapStateForbiddenArea) {
+        for (UWRCTForbiddenAreaView *rectView in self.forbiddenViews) {
+            if (_viewModel.isEdit) {
+                if (rectView.areaModel._isNewAdded) {
+                    [rectView beginEdit];
+                } else {
+                    [rectView prepareEdit];
+                }
+            } else {
+                [rectView endEdit];
+            }
+        }
+    }
+    
+    for (UWRCTForbiddenAreaView *view in _forbiddenViews) {
+        [view updateZoomScale:_scrollView.zoomScale];
+    }
+}
+
+#pragma mark - 虚拟墙
+
+- (void)setupVirtualWalls {
+    for (UWRCTVirtualWallView *item in _virtualWallViews) {
+        [item removeFromSuperview];
+    }
+    [_virtualWallViews removeAllObjects];
+    
+    NSArray *virtualWalls = [self.viewModel virtualWallModels];
+    if (virtualWalls.count == 0) {
+        return;
+    }
+    if (!self.virtualWallViews) {
+        self.virtualWallViews = [NSMutableArray new];
+    }
+    for (UWRCTMapAreaVirtualWall *virtualWall in virtualWalls) {
+        UWRCTVirtualWallView *virtualWallView = [[UWRCTVirtualWallView alloc] initWithAreaModel:virtualWall
+                                                                                     factorInfo:_viewModel.mapModel.factorInfo
+                                                                                      mapOrigin:_viewModel.mapOrigin];
+        virtualWallView.areaViewDelegate = self;
+        virtualWallView.scrollView = self.scrollView;
+        __weak typeof(self) weakSelf = self;
+        virtualWallView.beginEditHandle = ^(UWRCTVirtualWallView * _Nonnull view) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            for (UWRCTVirtualWallView *item in strongSelf.virtualWallViews) {
+                if (![item isEqual:view]) {
+                    [item prepareEdit];
+                }
+            }
+            [strongSelf.mapImageView bringSubviewToFront:view];
+        };
+        virtualWallView.editDoneHandle = ^(UWRCTVirtualWallView * _Nonnull view) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            NSArray *points = [view getLineRelativePoints];
+            UWRCTMapAreaVirtualWall *model = view.areaModel;
+            NSDictionary *params = @{
+                @"type": @(model.type),
+                @"extend": model.extend,
+                @"data": points
+            };
+            strongSelf.viewModel.onMapPointsDataChange(params);
+        };
+        [self.mapImageView addSubview:virtualWallView];
+        [self.virtualWallViews addObject:virtualWallView];
+    }
+    
+    if (self.viewModel.mapState == UWMapStateVirtualWall) {
+        for (UWRCTVirtualWallView *virtualWallView in self.virtualWallViews) {
+            if (_viewModel.isEdit) {
+                if (virtualWallView.areaModel._isNewAdded) {
+                    [virtualWallView beginEdit];
+                } else {
+                    [virtualWallView prepareEdit];
+                }
+            } else {
+                [virtualWallView endEdit];
+            }
+        }
+    }
+    
+    for (UWRCTVirtualWallView *view in _virtualWallViews) {
+        [view updateZoomScale:_scrollView.zoomScale];
+    }
+}
+
+// MARK: - 门槛
+
+- (void)setupDoorsills {
+    for (UWRCTDoorsillView *item in _doorsillViews) {
+        [item removeFromSuperview];
+    }
+    [_doorsillViews removeAllObjects];
+    
+    NSArray *doorsills = [self.viewModel doorsillModels];
+    if (doorsills.count == 0) {
+        return;
+    }
+    if (!self.doorsillViews) {
+        self.doorsillViews = [NSMutableArray new];
+    }
+    for (UWRCTMapAreaDoorsill *doorsill in doorsills) {
+        UWRCTDoorsillView *doorsillView = [[UWRCTDoorsillView alloc] initWithAreaModel:doorsill
+                                                                            factorInfo:_viewModel.mapModel.factorInfo
+                                                                             zoomScale:_scrollView.zoomScale
+                                                                             mapOrigin:_viewModel.mapOrigin];
+        doorsillView.areaViewDelegate = self;
+        doorsillView.scrollView = self.scrollView;
+        doorsillView.mapImageView = self.mapImageView;
+        __weak typeof(self) weakSelf = self;
+        doorsillView.beginEditHandle = ^(UWRCTDoorsillView * _Nonnull view) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            for (UWRCTDoorsillView *item in strongSelf.doorsillViews) {
+                if (![item isEqual:view]) {
+                    [item prepareEdit];
+                }
+            }
+            [strongSelf.mapImageView bringSubviewToFront:view];
+        };
+        doorsillView.editDoneHandle = ^(UWRCTDoorsillView * _Nonnull view) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            NSArray *points = [view getLineRelativePoints];
+            UWRCTMapAreaDoorsill *model = view.areaModel;
+            NSDictionary *params = @{
+                @"type": @(model.type),
+                @"extend": model.extend,
+                @"data": points
+            };
+            strongSelf.viewModel.onMapPointsDataChange(params);
+        };
+        [self.mapImageView addSubview:doorsillView];
+        [self.doorsillViews addObject:doorsillView];
+    }
+    
+    if (self.viewModel.mapState == UWMapStateDoorsill) {
+        for (UWRCTDoorsillView *doorsillView in self.doorsillViews) {
+            if (_viewModel.isEdit) {
+                if (doorsillView.areaModel._isNewAdded) {
+                    [doorsillView beginEdit];
+                } else {
+                    [doorsillView prepareEdit];
+                }
+            } else {
+                [doorsillView endEdit];
+            }
+        }
+    }
+    
+    for (UWRCTDoorsillView *view in _doorsillViews) {
+        [view updateZoomScale:_scrollView.zoomScale];
+    }
+}
+
+// MARK: - 虚拟物品
+
+- (void)setupMaterialObject {
+    if (!_materialContainerView) {
+        _materialContainerView = [[UIView alloc] initWithFrame:self.mapImageView.bounds];
+        [_mapImageView addSubview:_materialContainerView];
+    }
+    [self updateMaterialObject];
+}
+
+- (void)updateMaterialObject {
+    // 地图更新后，可能 width 和 height 会改变，此时要用新的 bounds 来更新 materialContainerView 的 frame
+    _materialContainerView.frame = _mapImageView.bounds;
+    NSArray *materials = _viewModel.mapModel.mapData.materialObjectList;
+    
+    // 通过显示/隐藏的方式来展示虚拟物品，避免频繁创建/销毁 container
+    if (materials.count == 0) {
+        _materialContainerView.hidden = YES;
+    } else {
+        _materialContainerView.hidden = NO;
+    }
+    
+    for (UWRCTMaterialObjectView *subview in _materialContainerView.subviews) {
+        [subview removeFromSuperview];
+    }
+    
+    for (UWRCTMapMaterialObject *material in materials) {
+        CGRect frame = CGRectMake(0, 0, material.width, material.height);
+        // 测试中发现虚拟物品的宽高与图片实际的宽高不符，需要 RN 传正确的宽高才能正常显示
+        UWRCTMaterialObjectView *materialView = [[UWRCTMaterialObjectView alloc] initWithFrame:frame
+                                                                                materialObject:material];
+        materialView.center = material.position;
+        [_materialContainerView addSubview:materialView];
+    }
+}
+
+#pragma mark - UWRCTAreaViewProtocol
+- (void)editingAreaViewDidClose:(__kindof UIView *)areaView {
+    if ([areaView isKindOfClass:[UWRCTSelectCleanAreaView class]]) {
+        UWRCTSelectCleanAreaView *selectCleanView = (UWRCTSelectCleanAreaView *)areaView;
+        [_selectCleanViews removeObject:selectCleanView];
+        [_viewModel removeSelectCleanArea:selectCleanView.areaModel];
+    } else if ([areaView isKindOfClass:[UWRCTVirtualWallView class]]) {
+        UWRCTVirtualWallView *virtualWallView = (UWRCTVirtualWallView *)areaView;
+        [_virtualWallViews removeObject:virtualWallView];
+        [_viewModel removeVirtualWall:virtualWallView.areaModel];
+    } else if ([areaView isKindOfClass:[UWRCTForbiddenAreaView class]]) {
+        UWRCTForbiddenAreaView *forbiddenAreaView = (UWRCTForbiddenAreaView *)areaView;
+        [_forbiddenViews removeObject:forbiddenAreaView];
+        [_viewModel removeForbiddenArea:forbiddenAreaView.areaModel];
+    } else if ([areaView isKindOfClass:[UWRCTDoorsillView class]]) {
+        UWRCTDoorsillView *doorsillView = (UWRCTDoorsillView *)areaView;
+        [_doorsillViews removeObject:doorsillView];
+        [_viewModel removeDoorsill:doorsillView.areaModel];
+    }
+    
+    [areaView removeFromSuperview];
+    areaView = nil;
+}
+
+#pragma mark - Charger & Robot
+
+- (void)setupChargerImageView {
+    UWRCTPilePosition *pilePosition = _viewModel.mapModel.pilePosition;
+    _chargerAngle = (pilePosition.degree + 90) * M_PI / 180.0;
+    CGFloat pileRadius = pilePosition.radius;
+    CGRect circleBounds = CGRectMake(0, 0, pilePosition.radius * 2.0, pilePosition.radius * 2.0);
+//    CGFloat reverseScale = 1.0 / _scrollView.zoomScale;
+    
+    CGFloat factor = _viewModel.mapModel.factorInfo.factor;
+    CGFloat realWidth = 0.5 / factor;
+    
+    _pileTrayIconImageView = [[UIImageView alloc] init];
+    _pileTrayIconImageView.bounds = CGRectMake(0, 0, realWidth, realWidth);
+    _pileTrayIconImageView.center = _viewModel.chargerPosition;
+//    _pileTrayIconImageView.transform = CGAffineTransformConcat(CGAffineTransformMakeScale(reverseScale, reverseScale), CGAffineTransformMakeRotation(_chargerAngle));
+    _pileTrayIconImageView.transform = CGAffineTransformMakeRotation(_chargerAngle);
+    [_mapImageView insertSubview:_pileTrayIconImageView belowSubview:_robotBreathView];
+    
+    
+    _pileIconImageView = [[UIImageView alloc] init];
+    _pileIconImageView.bounds = CGRectMake(0, 0, realWidth, realWidth);
+    _pileIconImageView.center = _viewModel.chargerPosition;
+//    _pileIconImageView.transform = CGAffineTransformConcat(CGAffineTransformMakeScale(reverseScale, reverseScale), CGAffineTransformMakeRotation(_chargerAngle));
+    _pileIconImageView.transform = CGAffineTransformMakeRotation(_chargerAngle);
+    [_mapImageView addSubview:_pileIconImageView];
+    [self updateChargerImage];
+    
+    _chargerAroundView = [[UIView alloc] initWithFrame:circleBounds];
+    _chargerAroundView.hidden = YES;
+    _chargerAroundView.layer.backgroundColor = [UIColor uw_colorWithARGBHex:pilePosition.bgColor].CGColor;
+    // 圆角在地图数据刷新后再设置
+    _chargerAroundView.layer.masksToBounds = YES;
+    _chargerAroundView.center = _viewModel.chargerPosition;
+    [_mapImageView addSubview:_chargerAroundView];
+    
+    UIBezierPath *path = [UIBezierPath bezierPathWithRoundedRect:circleBounds cornerRadius:pileRadius];
+    _chargerAroundLineLayer = [CAShapeLayer layer];
+    _chargerAroundLineLayer.hidden = YES;
+    _chargerAroundLineLayer.path = path.CGPath;
+    _chargerAroundLineLayer.lineWidth = 3.0 * (1.0 / _scrollView.zoomScale);
+    _chargerAroundLineLayer.strokeColor = [UIColor uw_colorWithARGBHex:pilePosition.borderColor].CGColor;
+    _chargerAroundLineLayer.fillColor = [UIColor clearColor].CGColor;
+    _chargerAroundLineLayer.lineDashPattern = @[@(6.0 * (1.0/_scrollView.zoomScale)), @(6.0 * (1.0/_scrollView.zoomScale))];
+    [_chargerAroundView.layer addSublayer:_chargerAroundLineLayer];
+}
+
+- (void)updateChargerImage {
+    NSString *pileIconUrlStr = _viewModel.mapModel.pileIcon;
+    NSURL *pileIconImgURL = [NSURL URLWithString:pileIconUrlStr];
+    __weak typeof(self) weakSelf = self;
+    [_pileIconImageView sd_setImageWithURL:pileIconImgURL placeholderImage:nil options:SDWebImageAvoidAutoSetImage completed:^(UIImage * _Nullable image, NSError * _Nullable error, SDImageCacheType cacheType, NSURL * _Nullable imageURL) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        // 更新基站底座状态
+//        strongSelf.pileTrayIconImageView.bounds = CGRectMake(0, 0, image.size.width, image.size.height);
+        strongSelf.pileTrayIconImageView.center = strongSelf.viewModel.chargerPosition;
+        // 更新基站状态
+        strongSelf.pileIconImageView.image = image;
+//        strongSelf.pileIconImageView.bounds = CGRectMake(0, 0, image.size.width, image.size.height);
+        strongSelf.pileIconImageView.center = strongSelf.viewModel.chargerPosition;
+        
+        [strongSelf setNeedsLayout];
+//        CGFloat reverseScale = 1.0 / strongSelf.scrollView.zoomScale;
+//        strongSelf.pileTrayIconImageView.transform = CGAffineTransformConcat(CGAffineTransformMakeScale(reverseScale, reverseScale), CGAffineTransformMakeRotation(strongSelf.chargerAngle));
+//        strongSelf.pileIconImageView.transform = CGAffineTransformConcat(CGAffineTransformMakeScale(reverseScale, reverseScale), CGAffineTransformMakeRotation(strongSelf.chargerAngle));
+        strongSelf.pileTrayIconImageView.transform = CGAffineTransformMakeRotation(strongSelf.chargerAngle);
+        strongSelf.pileIconImageView.transform = CGAffineTransformMakeRotation(strongSelf.chargerAngle);
+    }];
+    
+    NSString *pileTrayIconUrlStr = _viewModel.mapModel.pileTrayIcon;
+    NSURL *pileTrayIconImgURL = [NSURL URLWithString:pileTrayIconUrlStr];
+    if (pileTrayIconImgURL) {
+        _pileTrayIconImageView.hidden = NO;
+        [_pileTrayIconImageView sd_setImageWithURL:pileTrayIconImgURL];
+    } else {
+        _pileTrayIconImageView.hidden = YES;
+    }
+}
+
+- (void)setupRobotImageView {
+    CGFloat factor = _viewModel.mapModel.factorInfo.factor;
+    CGFloat realWidth = 0.5 / factor;   // 0.5 米是实体基站/机器人的实际宽度
+    _robotView = [[UWMapRobotView alloc] init];
+//    _robotView.bounds = CGRectMake(0, 0, 24, 24);
+    _robotView.bounds = CGRectMake(0, 0, realWidth, realWidth);
+    _robotView.center = _viewModel.robotPosition;
+    _robotView.hidden = _viewModel.mapModel.pathData.count == 0;
+    [_mapImageView addSubview:_robotView];
+    [self updateRobotImage];
+}
+
+- (void)updateRobotImage {
+    NSURL *imgURL = [NSURL URLWithString:_viewModel.mapModel.markerIcon];
+    __weak typeof(self) weakSelf = self;
+    [_robotView.imageView sd_setImageWithURL:imgURL placeholderImage:nil options:SDWebImageAvoidAutoSetImage completed:^(UIImage * _Nullable image, NSError * _Nullable error, SDImageCacheType cacheType, NSURL * _Nullable imageURL) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        strongSelf.robotView.imageView.image = image;
+//        strongSelf.robotView.bounds = CGRectMake(0, 0, image.size.width, image.size.height);
+        strongSelf.robotView.center = strongSelf.viewModel.robotPosition;
+        [strongSelf setNeedsLayout];
+//        CGFloat reverseScale = 1.0 / strongSelf.scrollView.zoomScale;
+        // 扫地机图标随着地图缩放而缩放
+        CGFloat robotAngle = [strongSelf.viewModel robotAngle];
+//        strongSelf.robotView.transform = CGAffineTransformConcat(CGAffineTransformMakeScale(reverseScale, reverseScale), CGAffineTransformMakeRotation(robotAngle));
+        strongSelf.robotView.transform = CGAffineTransformMakeRotation(robotAngle);
+    }];
+}
+
+- (void)setupFixedPointImageView {
+    UIImage *image = [UIImage imageNamed:@"vacuum_fixed_point"];
+    _fixedPointImageView = [[UIImageView alloc] initWithImage:image];
+    _fixedPointImageView.frame = CGRectMake(0, 0, 18, 21);
+    _fixedPointImageView.center = _viewModel.mapOrigin;
+    _fixedPointImageView.hidden = YES;
+    [_mapImageView addSubview:_fixedPointImageView];
+    [self updateAppointImage];
+}
+
+- (void)updateAppointImage {
+    NSURL *imgURL = [NSURL URLWithString:_viewModel.mapModel.appointIcon];
+    __weak typeof(self) weakSelf = self;
+    [_fixedPointImageView sd_setImageWithURL:imgURL placeholderImage:nil options:SDWebImageAvoidAutoSetImage completed:^(UIImage * _Nullable image, NSError * _Nullable error, SDImageCacheType cacheType, NSURL * _Nullable imageURL) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        strongSelf.fixedPointImageView.image = image;
+        
+        CGPoint pointCleanPoint = [strongSelf currentPointCleanPoint];
+        CGFloat fixedPointCenterX = pointCleanPoint.x;
+        CGFloat reverseScale = 1.0 / strongSelf.scrollView.zoomScale;
+        CGFloat fixedPointCenterY = pointCleanPoint.y - (strongSelf.fixedPointImageView.bounds.size.height / 2.0) * reverseScale;
+        strongSelf.fixedPointImageView.center = CGPointMake(fixedPointCenterX, fixedPointCenterY);
+        [strongSelf setNeedsLayout];
+    }];
+}
+
+#pragma mark - Debug View
+
+- (void)setupDebugView {
+    _debugRedTapPoint = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 6, 6)];
+    _debugRedTapPoint.backgroundColor = [UIColor redColor];
+    _debugRedTapPoint.layer.cornerRadius = 3.0;
+    _debugRedTapPoint.layer.masksToBounds = YES;
+//    _debugRedTapPoint.hidden = YES;
+    [_mapImageView addSubview:_debugRedTapPoint];
+}
+
+#pragma mark - Layout Subview
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+//    self.scrollView.frame = self.bounds;
+    
+//    if (self.contentView) {
+//        CGFloat mapWidth = self.viewModel.mapWidth;
+//        CGFloat mapHeight = self.viewModel.mapHeight;
+        
+//        CGFloat contentViewWidth = self.scrollView.frame.size.width * 3;
+//        CGFloat contentViewHeight = self.scrollView.frame.size.height * 3;
+//
+//        self.contentView.frame = CGRectMake(0, 0, contentViewWidth, contentViewHeight);
+//        self.contentView.center = CGPointMake(CGRectGetWidth(self.scrollView.frame) / 2.0,
+//                                              CGRectGetHeight(self.scrollView.frame) / 2.0);
+        
+//        CGFloat mapImageViewX = (contentViewWidth - mapWidth) / 2.0;
+//        CGFloat mapImageViewY = (contentViewHeight - mapHeight) / 2.0;
+//        self.mapImageView.frame = CGRectMake(mapImageViewX, mapImageViewY, mapWidth, mapHeight);
+//
+//        CGFloat ratio = [self suitableRatio];
+//        [self.scrollView setZoomScale:ratio animated:NO];
+//    }
+}
+
+- (CGFloat)suitableRatio {
+    
+    CGFloat mapWidth = self.viewModel.mapWidth;
+    CGFloat mapHeight = self.viewModel.mapHeight;
+    
+    CGFloat contentViewWidth = fabs(floor(_viewModel.mapDegree)) == 90.0 ? self.scrollView.bounds.size.height : self.scrollView.bounds.size.width;
+    CGFloat contentViewHeight = fabs(floor(_viewModel.mapDegree)) == 90.0 ? self.scrollView.bounds.size.width : self.scrollView.bounds.size.height;
+    
+    CGFloat xRatio = mapWidth == 0.0 ? 1.0 : contentViewWidth / mapWidth;
+    CGFloat yRatio = mapHeight == 0.0 ? 1.0 : contentViewHeight / mapHeight;
+    CGFloat ratio = MIN(xRatio, yRatio);
+    
+    return ratio;
+}
+
+#pragma mark - Hit Test
+
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    BOOL flag = [super pointInside:point withEvent:event];
+    return flag;
+}
+
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hitView = [super hitTest:point withEvent:event];
+    return hitView;
+}
+
+- (UINavigationController *)findNavigationController {
+    UIResponder *responder = self;
+    while (responder) {
+        if ([responder isKindOfClass:[UIViewController class]]) {
+            UIViewController *viewController = (UIViewController *)responder;
+            return viewController.navigationController;
+        }
+        responder = responder.nextResponder;
+    }
+    return nil;
+}
+
+@end
